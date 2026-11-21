@@ -240,6 +240,10 @@ namespace
     bool pendingRecreate = false;
     bool permanentFailure = false;
     unsigned frameCount = 0;
+    // Frame begun at the previous EndScene, ended once the images rendered from its views arrive.
+    XrFrameState pendingFrame{XR_TYPE_FRAME_STATE};
+    XrView pendingViews[2]{{XR_TYPE_VIEW},{XR_TYPE_VIEW}};
+    bool frameBegun=false;
     std::atomic<float> displayRefreshHz{0};
     std::atomic<unsigned> producerRequest{2};
     std::atomic<bool> producerActive{false};
@@ -1104,6 +1108,7 @@ namespace
         if(!CreateControllerActions()) Log("Controller actions unavailable; headset rendering retained without controller input");
         else lastFailure.clear();
         frameCount = 0;
+        frameBegun = false;
         Log("OpenXR session created; game rendering remains flat-screen");
         return true;
     }
@@ -1117,6 +1122,8 @@ namespace
         Log("OpenXR disabled for this process; flat-screen game continues");
     }
 
+    bool SubmitFrame(const XrFrameState& state,const XrView (&views)[2]);
+
     void OnEndScene()
     {
         if (!enabled || permanentFailure) return;
@@ -1128,7 +1135,7 @@ namespace
             unsigned width=0,height=0;
             if(OpenXRVR::PreviewEyeResolution(scale,width,height))
             {
-                // No acquired image/frame is active here. Complete old copy
+                // No swapchain image is acquired here. Complete old copy
                 // work before retiring its swapchains or native eye textures.
                 if(vulkanBridge)
                 {
@@ -1203,6 +1210,7 @@ namespace
                     if (!Check("xrEndSession", xrEndSession(session)))
                     { Fallback("OpenXR end session failed"); return; }
                     running = false;
+                    frameBegun=false;
                     gameplayPacing=false;
                     AcquireSRWLockExclusive(&eyeLock);
                     eyeViewsValid = false;
@@ -1239,21 +1247,29 @@ namespace
         // Relying on the preceding frame's fence races a reused eye texture.
         if(eyeImageProvider) eyeImageProvider();
         if(permanentFailure || !running) return;
+        if(frameBegun && !producerActive)
+        {
+            frameBegun=false;
+            if(!SubmitFrame(pendingFrame,pendingViews)) return;
+        }
         XrFrameWaitInfo wait{XR_TYPE_FRAME_WAIT_INFO};
         XrFrameState state{XR_TYPE_FRAME_STATE};
         VRProfile::BeforeXRWait();
-        if(producerActive){gameplayPacing=true;return;}
+        if(producerActive){frameBegun=false;gameplayPacing=true;return;}
         {
             VRProfile::Scope profile(VRProfile::Metric::XRWait);
             result = xrWaitFrame(session, &wait, &state);
         }
         if (XR_FAILED(result))
         { Check("xrWaitFrame", result); Fallback("OpenXR frame wait failed"); return; }
-        SampleControllerInput(state.predictedDisplayTime);
+        // GTA builds a frame one EndScene before it renders it, so its images reach
+        // the frame after the one begun here: predict the pose one period further.
+        const XrTime poseTime=state.predictedDisplayTime+state.predictedDisplayPeriod;
+        SampleControllerInput(poseTime);
         if(!panelActive || !panelAnchored || sessionState!=XR_SESSION_STATE_FOCUSED) UpdatePanelPointer();
         XrViewLocateInfo locate{XR_TYPE_VIEW_LOCATE_INFO};
         locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        locate.displayTime = state.predictedDisplayTime;
+        locate.displayTime = poseTime;
         locate.space = localSpace;
         XrViewState viewState{XR_TYPE_VIEW_STATE};
         XrView views[2]{{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
@@ -1279,7 +1295,7 @@ namespace
                         views[i].pose.orientation.w},
                     {views[i].fov.angleLeft, views[i].fov.angleRight, views[i].fov.angleUp, views[i].fov.angleDown},floorSpace};
             }
-            eyeDisplayTime = state.predictedDisplayTime;
+            eyeDisplayTime = poseTime;
         }
         ReleaseSRWLockExclusive(&eyeLock);
         XrFrameBeginInfo begin{XR_TYPE_FRAME_BEGIN_INFO};
@@ -1289,6 +1305,13 @@ namespace
         }
         if (XR_FAILED(result))
         { Check("xrBeginFrame", result); Fallback("OpenXR frame begin failed"); return; }
+        // The game renders its next frame from these views; submit it for this display time.
+        pendingFrame=state; pendingViews[0]=views[0]; pendingViews[1]=views[1]; frameBegun=true;
+    }
+
+    bool SubmitFrame(const XrFrameState& state,const XrView (&views)[2])
+    {
+        XrResult result;
         XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};
         end.displayTime = state.predictedDisplayTime;
         end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1382,7 +1405,7 @@ namespace
         else if(haveEyeImages && state.shouldRender && !panelActive)
         {
             // Destroying the session releases any outstanding acquisition.
-            Fallback("OpenXR eye transfer failed; returning to desktop"); return;
+            Fallback("OpenXR eye transfer failed; returning to desktop"); return false;
         }
         if(panelActive && panelChain && state.shouldRender && eyeViewsValid)
         {
@@ -1403,10 +1426,10 @@ namespace
             XrSwapchainImageAcquireInfo acquire{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
             if(!CheckImageStep("xrAcquireSwapchainImage(panel)",RuntimeQueueCall(VRProfile::Metric::XRQueueAcquire,
                 [&](){return api.acquireSwapchainImage(panelChain->handle,&acquire,&index);})))
-                {Fallback("Panel acquisition failed");return;}
+                {Fallback("Panel acquisition failed");return false;}
             XrSwapchainImageWaitInfo waitImage{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};waitImage.timeout=1000000000;
             if(!CheckImageStep("xrWaitSwapchainImage(panel)",api.waitSwapchainImage(panelChain->handle,&waitImage)))
-                {Fallback("Panel image wait failed");return;}
+                {Fallback("Panel image wait failed");return false;}
             bool done=false;
             if(vulkanEnabled)
                 done=index<panelChain->vulkanImages.size() && panelBridge->WaitPrevious() &&
@@ -1427,7 +1450,7 @@ namespace
             XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
             if(!done || !CheckImageStep("xrReleaseSwapchainImage(panel)",RuntimeQueueCall(VRProfile::Metric::XRQueueRelease,
                 [&](){return api.releaseSwapchainImage(panelChain->handle,&release);})))
-                {Fallback("Panel transfer failed");return;}
+                {Fallback("Panel transfer failed");return false;}
             panel.space=localSpace;panel.eyeVisibility=XR_EYE_VISIBILITY_BOTH;panel.pose=panelPose;
             panel.size={2.4f,2.4f*(panelHeight-4)/panelWidth};
             panel.subImage.swapchain=panelChain->handle;
@@ -1465,7 +1488,7 @@ namespace
             result = RuntimeQueueCall(VRProfile::Metric::XRQueueEnd,[&](){return xrEndFrame(session, &end);});
         }
         if (XR_FAILED(result))
-        { Check("xrEndFrame", result); Fallback("OpenXR frame end failed"); return; }
+        { Check("xrEndFrame", result); Fallback("OpenXR frame end failed"); return false; }
         if(copied)
         {
             if(imagePoseTime>0 && state.predictedDisplayTime>=imagePoseTime)
@@ -1495,6 +1518,7 @@ namespace
                 frameCount, static_cast<long long>(state.predictedDisplayTime), state.shouldRender);
             Log(line);
         }
+        return true;
     }
 }
 
